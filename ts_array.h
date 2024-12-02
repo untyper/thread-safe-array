@@ -113,12 +113,10 @@ public:
     // Try to set the value atomically
     std::shared_ptr<T> expected = nullptr;
 
-    if (!std::atomic_compare_exchange_strong_explicit(
+    if (!std::atomic_compare_exchange_strong(
       &this->data[index].value,
       &expected,
-      new_value,
-      std::memory_order_release,
-      std::memory_order_relaxed))
+      new_value))
     {
       // Failed to set the value; someone else may have set it
       // Do not push the index back into the free list, as it is now in use
@@ -134,8 +132,7 @@ public:
   {
     for (std::size_t i = 0; i < Size; ++i)
     {
-      std::shared_ptr<T> element = std::atomic_load_explicit(
-        &this->data[i].value, std::memory_order_acquire);
+      std::shared_ptr<T> element = std::atomic_load(&this->data[i].value);
 
       if (element && predicate(*element))
       {
@@ -160,18 +157,16 @@ public:
       return false; // Invalid index
     }
 
-    std::shared_ptr<T> expected = std::atomic_load_explicit(
-      &this->data[index].value, std::memory_order_acquire);
+    std::shared_ptr<T> expected = std::atomic_load(&this->data[index].value);
 
     while (expected)
     {
-      if (std::atomic_compare_exchange_weak_explicit(
-        &this->data[index].value,
-        &expected,
-        nullptr,
-        std::memory_order_acq_rel,
-        std::memory_order_relaxed))
+      if (std::atomic_compare_exchange_weak(
+          &this->data[index].value,
+          &expected,
+          std::shared_ptr<T>(nullptr)))
       {
+        // The shared_ptr destructor will handle deletion when no references remain
         this->push_free_index(index);
         return true; // Successfully erased
       }
@@ -189,8 +184,7 @@ public:
       return std::nullopt; // Invalid index
     }
 
-    std::shared_ptr<T> element = std::atomic_load_explicit(
-      &this->data[index].value, std::memory_order_acquire);
+    std::shared_ptr<T> element = std::atomic_load(&this->data[index].value);
 
     if (element)
     {
@@ -207,13 +201,18 @@ public:
 
     for (std::size_t i = 0; i < Size; ++i)
     {
-      if (std::atomic_load_explicit(&this->data[i].value, std::memory_order_acquire))
+      if (std::atomic_load(&this->data[i].value))
       {
         ++count;
       }
     }
 
     return count;
+  }
+
+  std::size_t capacity() const
+  {
+    return Size;
   }
 
   Array()
