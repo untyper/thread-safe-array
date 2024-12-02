@@ -22,38 +22,69 @@ private:
   };
 
   std::array<Entry, Size> data;
-  std::atomic<size_t> free_list_head{ 0 }; // Index of the first free slot
+  std::atomic<uint64_t> free_list_head; // Stores index and counter
   static constexpr size_t INVALID_INDEX = Size;
+
+  // Helper functions to pack and unpack index and counter
+  uint64_t pack_index_counter(size_t index, size_t counter) const
+  {
+    return (static_cast<uint64_t>(counter) << 32) | index;
+  }
+
+  void unpack_index_counter(uint64_t value, size_t& index, size_t& counter) const
+  {
+    index = static_cast<size_t>(value & 0xFFFFFFFF);
+    counter = static_cast<size_t>(value >> 32);
+  }
 
   // Push an index onto the free list
   void push_free_index(size_t index)
   {
-    size_t old_head = this->free_list_head.load(std::memory_order_relaxed);
+    uint64_t old_head_value = this->free_list_head.load(std::memory_order_relaxed);
+    uint64_t new_head_value;
+    size_t old_head_index, old_head_counter;
 
     do
     {
-      this->data[index].next_free_index.store(old_head, std::memory_order_relaxed);
+      unpack_index_counter(old_head_value, old_head_index, old_head_counter);
+
+      // Set the next_free_index in the Entry to the old head index
+      this->data[index].next_free_index.store(old_head_index, std::memory_order_relaxed);
+
+      // Prepare new head value with the new index and incremented counter
+      size_t new_counter = old_head_counter + 1;
+      new_head_value = pack_index_counter(index, new_counter);
     } while (!this->free_list_head.compare_exchange_weak(
-      old_head, index, std::memory_order_release, std::memory_order_relaxed));
+      old_head_value, new_head_value, std::memory_order_release, std::memory_order_relaxed));
   }
 
   // Pop an index from the free list
   bool pop_free_index(size_t& index)
   {
-    size_t old_head = this->free_list_head.load(std::memory_order_relaxed);
+    uint64_t old_head_value = this->free_list_head.load(std::memory_order_relaxed);
+    uint64_t new_head_value;
+    size_t old_head_index, old_head_counter;
 
     do
     {
-      if (old_head == INVALID_INDEX)
+      unpack_index_counter(old_head_value, old_head_index, old_head_counter);
+
+      if (old_head_index == INVALID_INDEX)
       {
         return false; // Free list is empty
       }
 
-      index = old_head;
-      size_t next = this->data[index].next_free_index.load(std::memory_order_relaxed);
+      index = old_head_index;
+
+      // Load the next index from the Entry
+      size_t next_index = this->data[index].next_free_index.load(std::memory_order_relaxed);
+
+      // Prepare new head value with next_index and incremented counter
+      size_t new_counter = old_head_counter + 1;
+      new_head_value = pack_index_counter(next_index, new_counter);
 
       if (this->free_list_head.compare_exchange_weak(
-        old_head, next, std::memory_order_acquire, std::memory_order_relaxed))
+        old_head_value, new_head_value, std::memory_order_acquire, std::memory_order_relaxed))
       {
         return true;
       }
@@ -81,8 +112,8 @@ public:
       std::memory_order_release,
       std::memory_order_relaxed))
     {
-      // Failed to set the value; put the index back into the free list
-      this->push_free_index(index);
+      // Failed to set the value; someone else may have set it
+      // Do not push the index back into the free list, as it is now in use
       return false;
     }
 
@@ -185,7 +216,9 @@ public:
     }
 
     this->data[Size - 1].next_free_index.store(INVALID_INDEX, std::memory_order_relaxed);
-    this->free_list_head.store(0, std::memory_order_relaxed);
+
+    // Initialize free_list_head with the initial index and counter 0
+    this->free_list_head.store(pack_index_counter(0, 0), std::memory_order_relaxed);
   }
 };
 
