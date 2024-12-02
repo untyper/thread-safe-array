@@ -11,38 +11,42 @@
 #include <optional>
 #include <functional>
 #include <array>
+#include <utility>
+#include <cstddef>
 // #include <iostream>
 
 template <typename T, std::size_t Size>
-class Array {
+class Array
+{
 private:
-  struct Entry {
-    std::atomic<std::shared_ptr<T>> value{ nullptr };
-    std::atomic<size_t> next_free_index{ 0 };
+  struct Entry
+  {
+    std::shared_ptr<T> value{ nullptr };
+    std::atomic<std::size_t> next_free_index{ 0 };
   };
 
   std::array<Entry, Size> data;
   std::atomic<uint64_t> free_list_head; // Stores index and counter
-  static constexpr size_t INVALID_INDEX = Size;
+  static constexpr std::size_t INVALID_INDEX = Size;
 
   // Helper functions to pack and unpack index and counter
-  uint64_t pack_index_counter(size_t index, size_t counter) const
+  uint64_t pack_index_counter(std::size_t index, std::size_t counter) const
   {
     return (static_cast<uint64_t>(counter) << 32) | index;
   }
 
-  void unpack_index_counter(uint64_t value, size_t& index, size_t& counter) const
+  void unpack_index_counter(uint64_t value, std::size_t& index, std::size_t& counter) const
   {
-    index = static_cast<size_t>(value & 0xFFFFFFFF);
-    counter = static_cast<size_t>(value >> 32);
+    index = static_cast<std::size_t>(value & 0xFFFFFFFF);
+    counter = static_cast<std::size_t>(value >> 32);
   }
 
   // Push an index onto the free list
-  void push_free_index(size_t index)
+  void push_free_index(std::size_t index)
   {
     uint64_t old_head_value = this->free_list_head.load(std::memory_order_relaxed);
     uint64_t new_head_value;
-    size_t old_head_index, old_head_counter;
+    std::size_t old_head_index, old_head_counter;
 
     do
     {
@@ -52,18 +56,18 @@ private:
       this->data[index].next_free_index.store(old_head_index, std::memory_order_relaxed);
 
       // Prepare new head value with the new index and incremented counter
-      size_t new_counter = old_head_counter + 1;
+      std::size_t new_counter = old_head_counter + 1;
       new_head_value = pack_index_counter(index, new_counter);
     } while (!this->free_list_head.compare_exchange_weak(
       old_head_value, new_head_value, std::memory_order_release, std::memory_order_relaxed));
   }
 
   // Pop an index from the free list
-  bool pop_free_index(size_t& index)
+  bool pop_free_index(std::size_t& index)
   {
     uint64_t old_head_value = this->free_list_head.load(std::memory_order_relaxed);
     uint64_t new_head_value;
-    size_t old_head_index, old_head_counter;
+    std::size_t old_head_index, old_head_counter;
 
     do
     {
@@ -77,10 +81,10 @@ private:
       index = old_head_index;
 
       // Load the next index from the Entry
-      size_t next_index = this->data[index].next_free_index.load(std::memory_order_relaxed);
+      std::size_t next_index = this->data[index].next_free_index.load(std::memory_order_relaxed);
 
       // Prepare new head value with next_index and incremented counter
-      size_t new_counter = old_head_counter + 1;
+      std::size_t new_counter = old_head_counter + 1;
       new_head_value = pack_index_counter(next_index, new_counter);
 
       if (this->free_list_head.compare_exchange_weak(
@@ -92,15 +96,19 @@ private:
   }
 
 public:
-  // Add an element to the array
-  bool insert(const std::shared_ptr<T>& value)
+  // Add an element to the array using perfect forwarding
+  template<typename... Args>
+  std::optional<std::size_t> insert(Args&&... args)
   {
-    size_t index;
+    std::size_t index;
 
     if (!this->pop_free_index(index))
     {
-      return false; // Array is full
+      return std::nullopt; // Array is full
     }
+
+    // Create a shared_ptr<T> by perfectly forwarding the arguments
+    std::shared_ptr<T> new_value = std::make_shared<T>(std::forward<Args>(args)...);
 
     // Try to set the value atomically
     std::shared_ptr<T> expected = nullptr;
@@ -108,23 +116,23 @@ public:
     if (!std::atomic_compare_exchange_strong_explicit(
       &this->data[index].value,
       &expected,
-      value,
+      new_value,
       std::memory_order_release,
       std::memory_order_relaxed))
     {
       // Failed to set the value; someone else may have set it
       // Do not push the index back into the free list, as it is now in use
-      return false;
+      return std::nullopt;
     }
 
-    return true;
+    return index;
   }
 
   // Find an element based on a predicate, returning its index
   template <typename Predicate>
-  std::optional<size_t> find_if(Predicate predicate) const
+  std::optional<std::size_t> find_if(Predicate predicate) const
   {
-    for (size_t i = 0; i < Size; ++i)
+    for (std::size_t i = 0; i < Size; ++i)
     {
       std::shared_ptr<T> element = std::atomic_load_explicit(
         &this->data[i].value, std::memory_order_acquire);
@@ -139,13 +147,13 @@ public:
   }
 
   // Find an element directly by value, returning its index
-  std::optional<size_t> find(const T& value) const
+  std::optional<std::size_t> find(const T& value) const
   {
     return this->find_if([&value](const T& element) { return element == value; });
   }
 
   // Remove an element based on its index
-  bool erase(size_t index)
+  bool erase(std::size_t index)
   {
     if (index >= Size)
     {
@@ -174,7 +182,7 @@ public:
   }
 
   // Retrieve an element at the given index
-  std::optional<std::shared_ptr<T>> at(size_t index) const
+  std::optional<T> at(std::size_t index) const
   {
     if (index >= Size)
     {
@@ -186,18 +194,18 @@ public:
 
     if (element)
     {
-      return element; // Return the shared_ptr
+      return *element; // Return a copy of T
     }
 
     return std::nullopt; // Element is null
   }
 
   // Get the current size of the array
-  size_t size() const
+  std::size_t size() const
   {
-    size_t count = 0;
+    std::size_t count = 0;
 
-    for (size_t i = 0; i < Size; ++i)
+    for (std::size_t i = 0; i < Size; ++i)
     {
       if (std::atomic_load_explicit(&this->data[i].value, std::memory_order_acquire))
       {
@@ -208,9 +216,10 @@ public:
     return count;
   }
 
-  Array() {
+  Array()
+  {
     // Initialize the free list
-    for (size_t i = 0; i < Size - 1; ++i)
+    for (std::size_t i = 0; i < Size - 1; ++i)
     {
       this->data[i].next_free_index.store(i + 1, std::memory_order_relaxed);
     }
