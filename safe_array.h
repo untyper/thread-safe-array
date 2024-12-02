@@ -16,7 +16,7 @@
 // #include <iostream>
 
 template <typename T, std::size_t Size>
-class Array
+class Safe_Array
 {
 private:
   struct Entry
@@ -96,9 +96,15 @@ private:
   }
 
 public:
+  struct Op_Result
+  {
+    std::size_t index{ 0 };
+    const T& value;
+  };
+
   // Add an element to the array using perfect forwarding
   template<typename... Args>
-  std::optional<std::size_t> insert(Args&&... args)
+  std::optional<Op_Result> insert(Args&&... args)
   {
     std::size_t index;
 
@@ -123,12 +129,12 @@ public:
       return std::nullopt;
     }
 
-    return index;
+    return Op_Result{ index, *new_value };
   }
 
   // Find an element based on a predicate, returning its index
   template <typename Predicate>
-  std::optional<std::size_t> find_if(Predicate predicate) const
+  std::optional<Op_Result> find_if(Predicate predicate) const
   {
     for (std::size_t i = 0; i < Size; ++i)
     {
@@ -136,7 +142,7 @@ public:
 
       if (element && predicate(*element))
       {
-        return i;
+        return Op_Result{ i, *element };
       }
     }
 
@@ -144,7 +150,7 @@ public:
   }
 
   // Find an element directly by value, returning its index
-  std::optional<std::size_t> find(const T& value) const
+  std::optional<Op_Result> find(const T& value) const
   {
     return this->find_if([&value](const T& element) { return element == value; });
   }
@@ -176,8 +182,27 @@ public:
     return false; // Element was already null or erased by another thread
   }
 
+  // Overload of erase to remove an element by reference
+  bool erase(const T& value)
+  {
+    for (size_t i = 0; i < Size; ++i)
+    {
+      // Load the current shared_ptr atomically
+      std::shared_ptr<T> current = std::atomic_load(&this->data[i].value);
+
+      // Check if the reference matches the current element
+      if (current && *current == value)
+      {
+        // Call the existing erase method using the index
+        return this->erase(i);
+      }
+    }
+
+    return false; // Element not found
+  }
+
   // Retrieve an element at the given index
-  std::optional<T> at(std::size_t index) const
+  std::optional<Op_Result> at(std::size_t index) const
   {
     if (index >= Size)
     {
@@ -188,7 +213,7 @@ public:
 
     if (element)
     {
-      return *element; // Return a copy of T
+      return Op_Result{ index, *element }; // Return a copy of T
     }
 
     return std::nullopt; // Element is null
@@ -215,7 +240,7 @@ public:
     return Size;
   }
 
-  Array()
+  Safe_Array()
   {
     // Initialize the free list
     for (std::size_t i = 0; i < Size - 1; ++i)
