@@ -118,7 +118,7 @@ public:
   struct Op_Result
   {
     std::size_t index{ 0 };
-    const T& value;
+    T& value;
   };
 
   // Add an element to the array using perfect forwarding
