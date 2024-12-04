@@ -95,6 +95,25 @@ private:
     } while (true);
   }
 
+  bool erase_unchecked(std::size_t index, std::shared_ptr<T>& expected)
+  {
+    while (expected)
+    {
+      if (std::atomic_compare_exchange_weak(
+        &this->data[index].value,
+        &expected,
+        std::shared_ptr<T>(nullptr)))
+      {
+        // The shared_ptr destructor will handle deletion when no references remain
+        this->push_free_index(index);
+        return true; // Successfully erased
+      }
+      // If compare_exchange_weak fails, value_container is updated to the current value
+    }
+
+    return false; // Element was already null or erased by another thread
+  }
+
 public:
   struct Op_Result
   {
@@ -164,28 +183,13 @@ public:
     }
 
     std::shared_ptr<T> expected = std::atomic_load(&this->data[index].value);
-
-    while (expected)
-    {
-      if (std::atomic_compare_exchange_weak(
-          &this->data[index].value,
-          &expected,
-          std::shared_ptr<T>(nullptr)))
-      {
-        // The shared_ptr destructor will handle deletion when no references remain
-        this->push_free_index(index);
-        return true; // Successfully erased
-      }
-      // If compare_exchange_weak fails, expected is updated to the current value
-    }
-
-    return false; // Element was already null or erased by another thread
+    return this->erase_unchecked(index, expected);
   }
 
   // Overload of erase to remove an element by reference
   bool erase(const T& value)
   {
-    for (size_t i = 0; i < Size; ++i)
+    for (std::size_t i = 0; i < Size; ++i)
     {
       // Load the current shared_ptr atomically
       std::shared_ptr<T> current = std::atomic_load(&this->data[i].value);
@@ -194,7 +198,7 @@ public:
       if (current && *current == value)
       {
         // Call the existing erase method using the index
-        return this->erase(i);
+        return this->erase_unchecked(i, current);
       }
     }
 
