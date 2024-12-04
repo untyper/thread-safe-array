@@ -15,7 +15,7 @@
 #include <cstddef>
 // #include <iostream>
 
-template <typename T, std::size_t Size>
+template <typename T, std::size_t Capacity>
 class Safe_Array
 {
 private:
@@ -25,9 +25,9 @@ private:
     std::atomic<std::size_t> next_free_index{ 0 };
   };
 
-  std::array<Entry, Size> data;
+  std::array<Entry, Capacity> data;
   std::atomic<uint64_t> free_list_head; // Stores index and counter
-  static constexpr std::size_t INVALID_INDEX = Size;
+  static constexpr std::size_t INVALID_INDEX = Capacity;
 
   // Helper functions to pack and unpack index and counter
   uint64_t pack_index_counter(std::size_t index, std::size_t counter) const
@@ -155,7 +155,7 @@ public:
   template <typename Predicate>
   std::optional<Op_Result> find_if(Predicate predicate) const
   {
-    for (std::size_t i = 0; i < Size; ++i)
+    for (std::size_t i = 0; i < Capacity; ++i)
     {
       std::shared_ptr<T> element = std::atomic_load(&this->data[i].value);
 
@@ -177,7 +177,7 @@ public:
   // Remove an element based on its index
   bool erase(std::size_t index)
   {
-    if (index >= Size)
+    if (index >= Capacity)
     {
       return false; // Invalid index
     }
@@ -189,7 +189,7 @@ public:
   // Overload of erase to remove an element by reference
   bool erase(const T& value)
   {
-    for (std::size_t i = 0; i < Size; ++i)
+    for (std::size_t i = 0; i < Capacity; ++i)
     {
       // Load the current shared_ptr atomically
       std::shared_ptr<T> current = std::atomic_load(&this->data[i].value);
@@ -208,7 +208,7 @@ public:
   // Retrieve an element at the given index
   std::optional<Op_Result> at(std::size_t index) const
   {
-    if (index >= Size)
+    if (index >= Capacity)
     {
       return std::nullopt; // Invalid index
     }
@@ -228,7 +228,7 @@ public:
   {
     std::size_t count = 0;
 
-    for (std::size_t i = 0; i < Size; ++i)
+    for (std::size_t i = 0; i < Capacity; ++i)
     {
       if (std::atomic_load(&this->data[i].value))
       {
@@ -241,18 +241,18 @@ public:
 
   std::size_t capacity() const
   {
-    return Size;
+    return Capacity;
   }
 
   Safe_Array()
   {
     // Initialize the free list
-    for (std::size_t i = 0; i < Size - 1; ++i)
+    for (std::size_t i = 0; i < Capacity - 1; ++i)
     {
       this->data[i].next_free_index.store(i + 1, std::memory_order_relaxed);
     }
 
-    this->data[Size - 1].next_free_index.store(INVALID_INDEX, std::memory_order_relaxed);
+    this->data[Capacity - 1].next_free_index.store(INVALID_INDEX, std::memory_order_relaxed);
 
     // Initialize free_list_head with the initial index and counter 0
     this->free_list_head.store(pack_index_counter(0, 0), std::memory_order_relaxed);
