@@ -1,6 +1,3 @@
-# thread-safe-array
-Lock-free thread-safe array for C++ 17 (and up)
-
 # Safe_Array
 
 A **lock-free**, **thread-safe**, fixed-capacity array that stores objects **in-place** (no per-element heap allocations) and supports concurrent `insert`, `erase` and read (via index, predicate, or iteration).
