@@ -6,256 +6,306 @@
 #ifndef LOCKFREE_THREADSAFE_ARRAY
 #define LOCKFREE_THREADSAFE_ARRAY
 
-#include <atomic>
-#include <memory>
-#include <optional>
-#include <functional>
 #include <array>
-#include <utility>
+#include <atomic>
+#include <cstdint>
 #include <cstddef>
-// #include <iostream>
+#include <optional>
+#include <type_traits>
+#include <new>
+#include <utility>
+//#include <iostream>
 
-template <typename T, std::size_t Capacity>
+template<typename T, std::size_t Capacity>
 class Safe_Array
 {
+  static_assert(std::is_nothrow_destructible<T>::value,
+    "T must be nothrow destructible");
+
 private:
   struct Entry
   {
-    std::shared_ptr<T> value{ nullptr };
+    // Low 2 bits = state; upper bits = ABA counter
+    static constexpr std::uint32_t STATE_MASK = 0x3;
+    enum SlotState : std::uint32_t
+    {
+      EMPTY = 0,
+      INIT = 1,
+      READY = 2,
+      REMOVING = 3
+    };
+
+    std::atomic<std::uint32_t> state{ EMPTY };
+    alignas(T) unsigned char storage[sizeof(T)];
     std::atomic<std::size_t> next_free_index{ 0 };
   };
 
   std::array<Entry, Capacity> data;
-  std::atomic<uint64_t> free_list_head; // Stores index and counter
+  std::atomic<std::uint64_t> free_list_head;
   static constexpr std::size_t INVALID_INDEX = Capacity;
 
-  // Helper functions to pack and unpack index and counter
-  uint64_t pack_index_counter(std::size_t index, std::size_t counter) const
+  std::uint64_t pack_index_counter(std::size_t idx, std::size_t ctr) const
   {
-    return (static_cast<uint64_t>(counter) << 32) | index;
+    return (std::uint64_t(ctr) << 32) | idx;
   }
 
-  void unpack_index_counter(uint64_t value, std::size_t& index, std::size_t& counter) const
+  void unpack_index_counter(std::uint64_t v, std::size_t& idx, std::size_t& ctr) const
   {
-    index = static_cast<std::size_t>(value & 0xFFFFFFFF);
-    counter = static_cast<std::size_t>(value >> 32);
+    idx = std::size_t(v & 0xFFFFFFFFULL);
+    ctr = std::size_t(v >> 32);
   }
 
-  // Push an index onto the free list
+  // Push a freed slot back onto the lock-free free-list
   void push_free_index(std::size_t index)
   {
-    uint64_t old_head_value = this->free_list_head.load(std::memory_order_relaxed);
-    uint64_t new_head_value;
-    std::size_t old_head_index, old_head_counter;
+    std::uint64_t old_head = free_list_head.load(std::memory_order_relaxed);
+    std::uint64_t new_head;
+    std::size_t old_idx, old_ctr;
 
     do
     {
-      unpack_index_counter(old_head_value, old_head_index, old_head_counter);
-
-      // Set the next_free_index in the Entry to the old head index
-      this->data[index].next_free_index.store(old_head_index, std::memory_order_relaxed);
-
-      // Prepare new head value with the new index and incremented counter
-      std::size_t new_counter = old_head_counter + 1;
-      new_head_value = pack_index_counter(index, new_counter);
-    } while (!this->free_list_head.compare_exchange_weak(
-      old_head_value, new_head_value, std::memory_order_release, std::memory_order_relaxed));
+      unpack_index_counter(old_head, old_idx, old_ctr);
+      data[index].next_free_index.store(old_idx, std::memory_order_relaxed);
+      new_head = pack_index_counter(index, old_ctr + 1);
+    } while (!free_list_head.compare_exchange_weak(
+      old_head, new_head,
+      std::memory_order_release,
+      std::memory_order_relaxed));
   }
 
-  // Pop an index from the free list
+  // Pop a free slot; returns false if none remain
   bool pop_free_index(std::size_t& index)
   {
-    uint64_t old_head_value = this->free_list_head.load(std::memory_order_relaxed);
-    uint64_t new_head_value;
-    std::size_t old_head_index, old_head_counter;
+    std::uint64_t old_head = free_list_head.load(std::memory_order_relaxed);
+    std::uint64_t new_head;
+    std::size_t old_idx, old_ctr;
 
     do
     {
-      unpack_index_counter(old_head_value, old_head_index, old_head_counter);
+      unpack_index_counter(old_head, old_idx, old_ctr);
 
-      if (old_head_index == INVALID_INDEX)
+      if (old_idx == INVALID_INDEX)
       {
-        return false; // Free list is empty
+        return false;
       }
 
-      index = old_head_index;
+      index = old_idx;
+      std::size_t next_idx = data[index].next_free_index.load(std::memory_order_relaxed);
 
-      // Load the next index from the Entry
-      std::size_t next_index = this->data[index].next_free_index.load(std::memory_order_relaxed);
+      new_head = pack_index_counter(next_idx, old_ctr + 1);
+    } while (!free_list_head.compare_exchange_weak(
+      old_head, new_head,
+      std::memory_order_acquire,
+      std::memory_order_relaxed));
 
-      // Prepare new head value with next_index and incremented counter
-      std::size_t new_counter = old_head_counter + 1;
-      new_head_value = pack_index_counter(next_index, new_counter);
-
-      if (this->free_list_head.compare_exchange_weak(
-        old_head_value, new_head_value, std::memory_order_acquire, std::memory_order_relaxed))
-      {
-        return true;
-      }
-    } while (true);
-  }
-
-  bool erase_unchecked(std::size_t index, std::shared_ptr<T>& expected)
-  {
-    while (expected)
-    {
-      if (std::atomic_compare_exchange_weak(
-        &this->data[index].value,
-        &expected,
-        std::shared_ptr<T>(nullptr)))
-      {
-        // The shared_ptr destructor will handle deletion when no references remain
-        this->push_free_index(index);
-        return true; // Successfully erased
-      }
-      // If compare_exchange_weak fails, value_container is updated to the current value
-    }
-
-    return false; // Element was already null or erased by another thread
+    return true;
   }
 
 public:
   struct Op_Result
   {
-    std::size_t index{ 0 };
+    std::size_t index;
     T& value;
   };
 
-  // Add an element to the array using perfect forwarding
+  // Insert an element by perfect-forwarding constructor args.
+  // Returns {index, reference} or nullopt if full/raced.
   template<typename... Args>
   std::optional<Op_Result> insert(Args&&... args)
   {
-    std::size_t index;
-
-    if (!this->pop_free_index(index))
+    std::size_t idx;
+    if (!pop_free_index(idx))
     {
-      return std::nullopt; // Array is full
-    }
-
-    // Create a shared_ptr<T> by perfectly forwarding the arguments
-    std::shared_ptr<T> new_value = std::make_shared<T>(std::forward<Args>(args)...);
-
-    // Try to set the value atomically
-    std::shared_ptr<T> expected = nullptr;
-
-    if (!std::atomic_compare_exchange_strong(
-      &this->data[index].value,
-      &expected,
-      new_value))
-    {
-      // Failed to set the value; someone else may have set it
-      // Do not push the index back into the free list, as it is now in use
       return std::nullopt;
     }
 
-    return Op_Result{ index, *new_value };
+    Entry& e = data[idx];
+
+    // 1) CAS EMPTY -> INIT (capture current ABA counter)
+    std::uint32_t old_st = e.state.load(std::memory_order_relaxed);
+    std::uint32_t init_st;
+
+    do
+    {
+      std::uint32_t ctr = old_st & ~Entry::STATE_MASK;
+
+      if ((old_st & Entry::STATE_MASK) != Entry::EMPTY)
+      {
+        return std::nullopt; // Racing fail
+      }
+
+      init_st = ctr | Entry::INIT;
+    } while (!e.state.compare_exchange_weak(
+      old_st, init_st,
+      std::memory_order_acq_rel,
+      std::memory_order_relaxed));
+
+    // 2) Construct T in-place
+    T* ptr = reinterpret_cast<T*>(&e.storage);
+    ::new (ptr) T(std::forward<Args>(args)...);
+
+    // 3) Bump counter, mark READY
+    std::uint32_t prev_ctr = init_st & ~Entry::STATE_MASK;
+    std::uint32_t bumped = (prev_ctr + (1u << 2)) & ~Entry::STATE_MASK;
+    e.state.store(bumped | Entry::READY, std::memory_order_release);
+
+    return Op_Result{ idx, *ptr };
   }
 
-  // Find an element based on a predicate, returning its index
-  template <typename Predicate>
-  std::optional<Op_Result> find_if(Predicate predicate) const
+  // Erase by index. Returns true if slot was READY.
+  bool erase(std::size_t idx)
+  {
+    if (idx >= Capacity)
+    {
+      return false;
+    }
+
+    Entry& e = data[idx];
+
+    // 1) CAS READY -> REMOVING
+    std::uint32_t old_st = e.state.load(std::memory_order_acquire);
+    std::uint32_t rem_st;
+
+    do
+    {
+      std::uint32_t state = old_st & Entry::STATE_MASK;
+      std::uint32_t ctr = old_st & ~Entry::STATE_MASK;
+
+      if (state != Entry::READY)
+      {
+        return false; // Nothing to erase
+      }
+
+      rem_st = ctr | Entry::REMOVING;
+    } while (!e.state.compare_exchange_weak(
+      old_st, rem_st,
+      std::memory_order_acq_rel,
+      std::memory_order_relaxed));
+
+    // 2) Destroy in-place
+    T* ptr = reinterpret_cast<T*>(&e.storage);
+    ptr->~T();
+
+    // 3) Bump counter, mark EMPTY
+    std::uint32_t prev_ctr = rem_st & ~Entry::STATE_MASK;
+    std::uint32_t bumped = (prev_ctr + (1u << 2)) & ~Entry::STATE_MASK;
+    e.state.store(bumped | Entry::EMPTY, std::memory_order_release);
+
+    // 4) Return slot to free list
+    push_free_index(idx);
+    return true;
+  }
+
+  // Find with predicate
+  template<typename Predicate>
+  std::optional<Op_Result> find_if(Predicate pred) const
   {
     for (std::size_t i = 0; i < Capacity; ++i)
     {
-      std::shared_ptr<T> element = std::atomic_load(&this->data[i].value);
+      std::uint32_t st = data[i].state.load(std::memory_order_acquire);
 
-      if (element && predicate(*element))
+      if ((st & Entry::STATE_MASK) == Entry::READY)
       {
-        return Op_Result{ i, *element };
+        T* ptr = const_cast<T*>(reinterpret_cast<T const*>(&data[i].storage));
+
+        if (pred(*ptr))
+        {
+          return Op_Result{ i, *ptr };
+        }
       }
     }
 
-    return std::nullopt; // Element not found
+    return std::nullopt;
   }
 
-  // Find an element directly by value, returning its index
+  // Find by value
   std::optional<Op_Result> find(const T& value) const
   {
-    return this->find_if([&value](const T& element) { return element == value; });
+    return find_if([&](const T& v)
+    {
+      return v == value;
+    });
   }
 
-  // Remove an element based on its index
-  bool erase(std::size_t index)
+  // Access by index
+  std::optional<Op_Result> at(std::size_t idx) const
   {
-    if (index >= Capacity)
+    if (idx >= Capacity)
     {
-      return false; // Invalid index
+      return std::nullopt;
     }
 
-    std::shared_ptr<T> expected = std::atomic_load(&this->data[index].value);
-    return this->erase_unchecked(index, expected);
+    std::uint32_t st = data[idx].state.load(std::memory_order_acquire);
+
+    if ((st & Entry::STATE_MASK) != Entry::READY)
+    {
+      return std::nullopt;
+    }
+
+    T* ptr = const_cast<T*>(reinterpret_cast<T const*>(&data[idx].storage));
+    return Op_Result{ idx, *ptr };
   }
 
-  // Overload of erase to remove an element by reference
-  bool erase(const T& value)
-  {
-    for (std::size_t i = 0; i < Capacity; ++i)
-    {
-      // Load the current shared_ptr atomically
-      std::shared_ptr<T> current = std::atomic_load(&this->data[i].value);
-
-      // Check if the reference matches the current element
-      if (current && *current == value)
-      {
-        // Call the existing erase method using the index
-        return this->erase_unchecked(i, current);
-      }
-    }
-
-    return false; // Element not found
-  }
-
-  // Retrieve an element at the given index
-  std::optional<Op_Result> at(std::size_t index) const
-  {
-    if (index >= Capacity)
-    {
-      return std::nullopt; // Invalid index
-    }
-
-    std::shared_ptr<T> element = std::atomic_load(&this->data[index].value);
-
-    if (element)
-    {
-      return Op_Result{ index, *element }; // Return a copy of T
-    }
-
-    return std::nullopt; // Element is null
-  }
-
-  // Get the current size of the array
+  // Count live elements (O(Capacity))
   std::size_t size() const
   {
-    std::size_t count = 0;
+    std::size_t cnt = 0;
 
     for (std::size_t i = 0; i < Capacity; ++i)
     {
-      if (std::atomic_load(&this->data[i].value))
+      std::uint32_t st = data[i].state.load(std::memory_order_acquire);
+
+      if ((st & Entry::STATE_MASK) == Entry::READY)
       {
-        ++count;
+        ++cnt;
       }
     }
 
-    return count;
+    return cnt;
   }
 
-  std::size_t capacity() const
+  constexpr std::size_t capacity() const
   {
     return Capacity;
   }
 
+  // Call f(index, value) for every live element.
+  template<typename Func>
+  void for_each(Func f) const
+  {
+    for (std::size_t i = 0; i < Capacity; ++i)
+    {
+      if (auto opt = at(i))
+      {
+        f(opt->index, opt->value);
+      }
+    }
+  }
+
   Safe_Array()
   {
-    // Initialize the free list
+    // Initialize free list: 0->1->2->…->INVALID_INDEX
     for (std::size_t i = 0; i < Capacity - 1; ++i)
     {
-      this->data[i].next_free_index.store(i + 1, std::memory_order_relaxed);
+      data[i].next_free_index.store(i + 1, std::memory_order_relaxed);
     }
 
-    this->data[Capacity - 1].next_free_index.store(INVALID_INDEX, std::memory_order_relaxed);
+    data[Capacity - 1]
+      .next_free_index.store(INVALID_INDEX, std::memory_order_relaxed);
+    free_list_head.store(pack_index_counter(0, 0), std::memory_order_relaxed);
+  }
 
-    // Initialize free_list_head with the initial index and counter 0
-    this->free_list_head.store(pack_index_counter(0, 0), std::memory_order_relaxed);
+  ~Safe_Array()
+  {
+    for (std::size_t i = 0; i < Capacity; ++i)
+    {
+      std::uint32_t st = data[i].state.load(std::memory_order_acquire);
+
+      if ((st & Entry::STATE_MASK) == Entry::READY)
+      {
+        reinterpret_cast<T*>(&data[i].storage)->~T();
+      }
+    }
   }
 };
 
